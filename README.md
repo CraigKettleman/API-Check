@@ -2,7 +2,7 @@
 
 快速检测 AI 服务商 API Key 是否可用的 CLI 工具。纯 Python 标准库，零依赖，跨平台。
 
-## 支持的服务商 (16 个)
+## 支持的服务商 (20 个)
 
 | 服务商 | Key 格式 | API 端点 |
 |--------|----------|----------|
@@ -20,6 +20,10 @@
 | SiliconFlow | `sk-...` | api.siliconflow.cn/v1 |
 | Fireworks AI | `fw_...` | api.fireworks.ai/inference/v1 |
 | Cohere | 40位字母数字 | api.cohere.com |
+| 阿里百炼 | `sk-...` | dashscope.aliyuncs.com/compatible-mode/v1 |
+| Minimax | `eyJ...` (JWT) | api.minimax.chat/v1 |
+| 讯飞星火 | `32hex:secret` | spark-api-open.xfyun.com/v1 |
+| 百度千帆 | `bce-...` | qianfan.baidubce.com/v2 |
 | **Mimo Token Plan** | `tp-...` | token-plan-cn.xiaomimimo.com/v1 |
 | **Mimo API** | `sk-...` | api.xiaomimimo.com/v1 |
 
