@@ -1,4 +1,4 @@
-# apicheck
+# API-Check
 
 快速检测 AI 服务商 API Key 是否可用的 CLI 工具。纯 Python 标准库，零依赖，跨平台。
 
