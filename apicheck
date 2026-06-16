@@ -1,0 +1,666 @@
+#!/usr/bin/env python3
+"""apicheck: 快速检测 AI 服务商 API Key 是否可用"""
+
+import os
+import sys
+import json
+import time
+import signal
+import argparse
+import concurrent.futures
+from urllib.request import Request, urlopen, ProxyHandler, build_opener
+from urllib.error import HTTPError, URLError
+
+# ─── Provider Definitions ───────────────────────────────────────────────
+
+PROVIDERS = {
+    # ── International ──
+    "openai": {
+        "name": "OpenAI",
+        "detect": lambda k: k.startswith("sk-") and not k.startswith("sk-ant-"),
+        "base_url": "https://api.openai.com/v1",
+        "test": "openai",
+    },
+    "anthropic": {
+        "name": "Anthropic",
+        "detect": lambda k: k.startswith("sk-ant-"),
+        "base_url": "https://api.anthropic.com",
+        "test": "anthropic",
+    },
+    "google": {
+        "name": "Google Gemini",
+        "detect": lambda k: k.startswith("AIza"),
+        "base_url": "https://generativelanguage.googleapis.com",
+        "test": "gemini",
+    },
+    "groq": {
+        "name": "Groq",
+        "detect": lambda k: k.startswith("gsk_"),
+        "base_url": "https://api.groq.com/openai/v1",
+        "test": "openai",
+    },
+    "together": {
+        "name": "Together AI",
+        "detect": lambda k: len(k) == 64 and not k.startswith("sk-"),
+        "base_url": "https://api.together.xyz/v1",
+        "test": "openai",
+    },
+    "mistral": {
+        "name": "Mistral AI",
+        "detect": lambda k: len(k) == 32 and k.isalnum(),
+        "base_url": "https://api.mistral.ai/v1",
+        "test": "openai",
+    },
+    "openrouter": {
+        "name": "OpenRouter",
+        "detect": lambda k: k.startswith("sk-or-"),
+        "base_url": "https://openrouter.ai/api/v1",
+        "test": "openrouter",
+    },
+    "fireworks": {
+        "name": "Fireworks AI",
+        "detect": lambda k: k.startswith("fw_"),
+        "base_url": "https://api.fireworks.ai/inference/v1",
+        "test": "openai",
+    },
+    "cohere": {
+        "name": "Cohere",
+        "detect": lambda k: len(k) == 40 and k.isalnum(),
+        "base_url": "https://api.cohere.com",
+        "test": "cohere",
+    },
+    # ── Chinese ──
+    "deepseek": {
+        "name": "DeepSeek",
+        "detect": lambda k: k.startswith("sk-") and not k.startswith("sk-ant-"),
+        "base_url": "https://api.deepseek.com",
+        "test": "openai",
+    },
+    "moonshot": {
+        "name": "Moonshot (月之暗面)",
+        "detect": lambda k: k.startswith("sk-") and not k.startswith("sk-ant-"),
+        "base_url": "https://api.moonshot.cn/v1",
+        "test": "openai",
+    },
+    "zhipu": {
+        "name": "Zhipu (智谱)",
+        "detect": lambda k: "." in k and len(k.split(".")) == 2,
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "test": "openai",
+    },
+    "qwen": {
+        "name": "Qwen/DashScope (通义千问)",
+        "detect": lambda k: k.startswith("sk-") and not k.startswith("sk-ant-"),
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "test": "openai",
+    },
+    "siliconflow": {
+        "name": "SiliconFlow (硅基流动)",
+        "detect": lambda k: k.startswith("sk-") and not k.startswith("sk-ant-"),
+        "base_url": "https://api.siliconflow.cn/v1",
+        "test": "openai",
+    },
+    # ── MiMo (Xiaomi) ──
+    "mimo_tp": {
+        "name": "Mimo Token Plan",
+        "detect": lambda k: k.startswith("tp-"),
+        "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+        "test": "mimo",
+    },
+    "mimo_sub": {
+        "name": "Mimo 订阅计划",
+        "detect": lambda k: k.startswith("sk-") and not k.startswith("sk-ant-"),
+        "base_url": "https://api.xiaomimimo.com/v1",
+        "test": "mimo",
+    },
+}
+
+SK_PREFIX_PROVIDERS = [
+    "openai", "deepseek", "moonshot", "qwen", "siliconflow", "mimo_sub",
+]
+
+# ─── Colors ─────────────────────────────────────────────────────────────
+
+_NO_COLOR = os.environ.get("NO_COLOR") or not sys.stdout.isatty()
+
+
+class C:
+    GREEN = "\033[92m"
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    CYAN = "\033[96m"
+    DIM = "\033[2m"
+    BOLD = "\033[1m"
+    END = "\033[0m"
+
+
+def colorize(text, color):
+    if _NO_COLOR:
+        return text
+    return f"{color}{text}{C.END}"
+
+
+# ─── HTTP Helper ────────────────────────────────────────────────────────
+
+_opener_cache = {}
+
+
+def _detect_proxy():
+    """Detect proxy from env vars or system settings."""
+    # 1. Environment variables (all platforms)
+    for var in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]:
+        val = os.environ.get(var)
+        if val:
+            return val
+
+    # 2. macOS system proxy
+    if sys.platform == "darwin":
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["networksetup", "-getsocksfirewallproxy", "Wi-Fi"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if "Enabled: Yes" in result.stdout:
+                server, port = None, None
+                for line in result.stdout.splitlines():
+                    if line.startswith("Server:"):
+                        server = line.split(":", 1)[1].strip()
+                    elif line.startswith("Port:"):
+                        port = line.split(":", 1)[1].strip()
+                if server and port:
+                    return f"socks5h://{server}:{port}"
+        except Exception:
+            pass
+
+    return None
+
+
+def _get_opener():
+    if _opener_cache.get("opener"):
+        return _opener_cache["opener"]
+
+    proxy_url = _detect_proxy()
+    if proxy_url:
+        handler = ProxyHandler({"https": proxy_url, "http": proxy_url})
+        opener = build_opener(handler)
+    else:
+        opener = build_opener()
+
+    _opener_cache["opener"] = opener
+    return opener
+
+
+def http_request(url, headers=None, data=None, method="GET", timeout=10):
+    req = Request(url, headers=headers or {}, data=data, method=method)
+    if data and method == "POST":
+        req.add_header("Content-Type", "application/json")
+    try:
+        opener = _get_opener()
+        with opener.open(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        return e.code, body
+    except URLError as e:
+        return 0, str(e.reason)
+    except Exception as e:
+        return 0, str(e)
+
+
+# ─── Provider-Specific Tests ───────────────────────────────────────────
+
+def test_openai(key, base_url):
+    headers = {"Authorization": f"Bearer {key}"}
+    status, body = http_request(f"{base_url}/models", headers=headers)
+    return _parse_openai(status, body)
+
+
+def test_anthropic(key, _base_url):
+    headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+    payload = json.dumps({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    status, body = http_request(
+        "https://api.anthropic.com/v1/messages",
+        headers=headers, data=payload, method="POST",
+    )
+    return _parse_anthropic(status, body)
+
+
+def test_gemini(key, _base_url):
+    status, body = http_request(
+        f"https://generativelanguage.googleapis.com/v1beta/models?key={key}",
+    )
+    return _parse_gemini(status, body)
+
+
+def test_openrouter(key, base_url):
+    headers = {"Authorization": f"Bearer {key}"}
+    status, body = http_request(f"{base_url}/auth/key", headers=headers)
+    if status == 200:
+        return "ok", "✓ 可用", []
+    return _parse_openai(status, body)
+
+
+def test_cohere(key, base_url):
+    headers = {"Authorization": f"Bearer {key}"}
+    status, body = http_request(f"{base_url}/v1/models", headers=headers)
+    return _parse_openai(status, body)
+
+
+def test_mimo(key, base_url):
+    # Try OpenAI-compatible first
+    headers = {"Authorization": f"Bearer {key}"}
+    status, body = http_request(f"{base_url}/models", headers=headers)
+    result = _parse_openai(status, body)
+    if result[0] in ("ok", "rate_limited", "quota"):
+        return result
+
+    # Fallback: Anthropic-compatible
+    anthropic_base = base_url.replace("/v1", "/anthropic")
+    aheaders = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+    payload = json.dumps({
+        "model": "mimo-v2.5-pro", "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    astatus, abody = http_request(
+        f"{anthropic_base}/v1/messages",
+        headers=aheaders, data=payload, method="POST",
+    )
+    aresult = _parse_anthropic(astatus, abody)
+    if aresult[0] in ("ok", "rate_limited", "quota"):
+        return aresult
+    return result if result[0] != "unknown" else aresult
+
+
+TEST_DISPATCH = {
+    "openai": test_openai,
+    "anthropic": test_anthropic,
+    "gemini": test_gemini,
+    "openrouter": test_openrouter,
+    "cohere": test_cohere,
+    "mimo": test_mimo,
+}
+
+
+# ─── Response Parsers ──────────────────────────────────────────────────
+
+def _extract_json_msg(body):
+    try:
+        err = json.loads(body)
+        return err.get("error", {}).get("message", "") or str(err)
+    except Exception:
+        return body[:200]
+
+
+def _parse_openai(status, body):
+    if status == 200:
+        try:
+            data = json.loads(body)
+            models = data.get("data", [])
+            return "ok", f"✓ 可用 — 模型数量: {len(models)}", models[:5]
+        except json.JSONDecodeError:
+            return "ok", "✓ 可用", []
+    if status == 401:
+        return "invalid", "✗ 无效 Key (401)", []
+    if status == 403:
+        return "invalid", "✗ 被禁止 (403)", []
+    if status == 429:
+        return "rate_limited", "⚠ 速率限制 (429)", []
+    if status == 402:
+        return "quota", "✗ 额度用完 (402)", []
+    if status >= 500:
+        return "error", f"✗ 服务端错误 ({status})", []
+    return "unknown", f"? 响应 {status}: {_extract_json_msg(body)}", []
+
+
+def _parse_anthropic(status, body):
+    if status == 200:
+        return "ok", "✓ 可用", []
+    if status == 401:
+        return "invalid", "✗ 无效 Key (401)", []
+    if status == 403:
+        return "invalid", "✗ 被禁止 (403)", []
+    if status == 429:
+        msg = _extract_json_msg(body)
+        if "quota" in msg.lower() or "credit" in msg.lower():
+            return "quota", f"✗ 额度用完 — {msg}", []
+        return "rate_limited", f"⚠ 速率限制 — {msg}", []
+    if status == 400:
+        msg = _extract_json_msg(body)
+        if "authentication" in msg.lower() or "api_key" in msg.lower():
+            return "invalid", f"✗ 无效 Key — {msg}", []
+        return "ok", "✓ 可用 (Key 有效)", []
+    if status == 402:
+        return "quota", "✗ 额度用完 (402)", []
+    if status >= 500:
+        return "error", f"✗ 服务端错误 ({status})", []
+    return "unknown", f"? 响应 {status}: {_extract_json_msg(body)}", []
+
+
+def _parse_gemini(status, body):
+    if status == 200:
+        try:
+            data = json.loads(body)
+            models = data.get("models", [])
+            return "ok", f"✓ 可用 — 模型数量: {len(models)}", models[:5]
+        except json.JSONDecodeError:
+            return "ok", "✓ 可用", []
+    if status in (400, 401, 403):
+        msg = _extract_json_msg(body)
+        if "API_KEY_INVALID" in body or "invalid" in msg.lower():
+            return "invalid", f"✗ 无效 Key — {msg}", []
+        return "invalid", f"✗ 认证失败 ({status}) — {msg}", []
+    if status == 429:
+        return "rate_limited", "⚠ 速率限制 (429)", []
+    if status >= 500:
+        return "error", f"✗ 服务端错误 ({status})", []
+    return "unknown", f"? 响应 {status}", []
+
+
+# ─── Status Display ────────────────────────────────────────────────────
+
+STATUS_DISPLAY = {
+    "ok":           ("✅", C.GREEN),
+    "invalid":      ("❌", C.RED),
+    "rate_limited": ("⚠️ ", C.YELLOW),
+    "quota":        ("💰", C.RED),
+    "error":        ("🔥", C.RED),
+    "unknown":      ("❓", C.YELLOW),
+}
+
+
+# ─── Main Logic ────────────────────────────────────────────────────────
+
+def detect_providers(key):
+    if key.startswith("sk-ant-"):
+        return ["anthropic"]
+    if key.startswith("AIza"):
+        return ["google"]
+    if key.startswith("gsk_"):
+        return ["groq"]
+    if key.startswith("sk-or-"):
+        return ["openrouter"]
+    if key.startswith("fw_"):
+        return ["fireworks"]
+    if key.startswith("tp-"):
+        return ["mimo_tp"]
+    if key.startswith("sk-"):
+        return list(SK_PREFIX_PROVIDERS)
+    return list(PROVIDERS.keys())
+
+
+def test_key(key, specific_provider=None):
+    if specific_provider:
+        candidates = [specific_provider]
+    else:
+        candidates = detect_providers(key)
+
+    results = []
+    for pid in candidates:
+        provider = PROVIDERS[pid]
+        test_fn = TEST_DISPATCH[provider["test"]]
+
+        start_time = time.time()
+        try:
+            status, msg, models = test_fn(key, provider["base_url"])
+        except Exception as e:
+            status, msg, models = "error", f"✗ 连接失败: {e}", []
+        elapsed = time.time() - start_time
+
+        results.append({
+            "provider": provider["name"],
+            "provider_id": pid,
+            "status": status,
+            "message": msg,
+            "models": models,
+            "elapsed": round(elapsed, 2),
+        })
+
+        if status in ("ok", "quota"):
+            break
+        if status == "invalid" and len(candidates) == 1:
+            break
+
+    return results
+
+
+def print_result(key_display, results):
+    print(f"\n{'─' * 60}")
+    print(f"Key: {colorize(key_display, C.CYAN)}")
+    for r in results:
+        icon, color = STATUS_DISPLAY.get(r["status"], ("❓", C.YELLOW))
+        elapsed_str = colorize(f" ({r['elapsed']}s)", C.DIM)
+        line = f"  {icon} {r['provider']}: {r['message']}{elapsed_str}"
+        print(colorize(line, color))
+        if r["models"]:
+            for m in r["models"][:3]:
+                mid = m.get("id", m.get("name", "?"))
+                print(f"      {colorize('→ ' + str(mid), C.DIM)}")
+            if len(r["models"]) > 3:
+                extra = len(r["models"]) - 3
+                print(f"      {colorize('→ ... 还有 ' + str(extra) + ' 个模型', C.DIM)}")
+
+
+NEON_BG = [
+    "\033[101m\033[97m",  # 亮红背景 + 白字
+    "\033[103m\033[30m",  # 亮黄背景 + 黑字
+    "\033[102m\033[30m",  # 亮绿背景 + 黑字
+    "\033[106m\033[30m",  # 亮青背景 + 黑字
+    "\033[104m\033[97m",  # 亮蓝背景 + 白字
+    "\033[105m\033[97m",  # 亮品红背景 + 白字
+]
+
+
+def neon_glow(text, offset):
+    """Per-char background color cycling — matches Java neonGlow()."""
+    out = []
+    for i, ch in enumerate(text):
+        style = NEON_BG[(i + offset) % len(NEON_BG)]
+        out.append(f"{style}\033[1m{ch}\033[0m")
+    return "".join(out)
+
+
+def neon(text, offset):
+    """Per-char foreground color cycling — matches Java neon()."""
+    palette = ["\033[91m", "\033[93m", "\033[92m", "\033[96m", "\033[94m", "\033[95m"]
+    out = []
+    for i, ch in enumerate(text):
+        c = palette[(i + offset) % len(palette)]
+        out.append(f"{c}\033[1m{ch}\033[0m")
+    return "".join(out)
+
+
+def print_neon_confirm(working):
+    """Neon glow animation — 40 frames, fixed duration."""
+    if _NO_COLOR or not sys.stdout.isatty():
+        if working > 0:
+            print(f"  恭喜可用 — 共 {working} 个 Key 可用!")
+        return
+
+    label = "⚡⚡⚡ 恭喜可用 ⚡⚡⚡"
+    prefix = "  检测结果: "
+    for frame in range(28):
+        sys.stdout.write(f"\r{prefix}{neon_glow(label, frame)}")
+        sys.stdout.flush()
+        time.sleep(0.08)
+    if working > 0:
+        sys.stdout.write(f"\r{prefix}{neon(label, 0)}\033[2m  — 共 {working} 个 Key 可用!\033[0m\n")
+    else:
+        sys.stdout.write("\r\033[K")
+    sys.stdout.flush()
+
+
+def mask_key(key):
+    if len(key) <= 12:
+        return key[:4] + "..." + key[-4:]
+    return key[:6] + "..." + key[-4:]
+
+
+# ─── CLI ────────────────────────────────────────────────────────────────
+
+VERSION = "1.2.0"
+
+BANNER = r"""
+{cyan}   █████╗ ██████╗ ██╗ ██████╗██╗  ██╗███████╗ ██████╗██╗  ██╗{end}
+{cyan}  ██╔══██╗██╔══██╗██║██╔════╝██║  ██║██╔════╝██╔════╝██║ ██╔╝{end}
+{cyan}  ███████║██████╔╝██║██║     ███████║█████╗  ██║     █████╔╝ {end}
+{cyan}  ██╔══██║██╔═══╝ ██║██║     ██╔══██║██╔══╝  ██║     ██╔═██╗ {end}
+{cyan}  ██║  ██║██║     ██║╚██████╗██║  ██║███████╗╚██████╗██║  ██╗{end}
+{cyan}  ╚═╝  ╚═╝╚═╝     ╚═╝ ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝{end}
+{dim}  ─── 快速检测 AI API Key 是否可用 v{version} ───{end}
+
+{bold}  支持 16 个服务商:{end}
+  {green}OpenAI{end}  {green}Anthropic{end}  {green}Google Gemini{end}  {green}DeepSeek{end}  {green}Groq{end}
+  {green}Together AI{end}  {green}Mistral{end}  {green}OpenRouter{end}  {green}Moonshot{end}  {green}Zhipu{end}
+  {green}Qwen/DashScope{end}  {green}SiliconFlow{end}  {green}Fireworks{end}  {green}Cohere{end}
+  {yellow}Mimo Token Plan{end} {dim}(tp-){end}  {yellow}Mimo 订阅计划{end} {dim}(sk-){end}
+
+{bold}  用法:{end}
+  {cyan}apicheck{end} {dim}<key>{end}                        检测单个 Key
+  {cyan}apicheck{end} {dim}tp-xxxx...{end}                   Mimo Token Plan
+  {cyan}apicheck{end} {dim}sk-xxx... sk-ant-xxx...{end}      检测多个 Key
+  {cyan}apicheck{end} {dim}--batch keys.txt{end}              批量检测
+  {cyan}apicheck{end} {dim}-q --batch keys.txt{end}           只显示可用
+  {cyan}apicheck{end} {dim}--provider deepseek sk-xxx{end}    指定服务商
+  {cyan}apicheck{end} {dim}--json sk-xxx{end}                 JSON 输出
+  {dim}echo "sk-xxx" | apicheck -{end}              管道输入
+
+{bold}  状态:{end}  {green}✅ 可用{end}  {red}❌ 无效{end}  {yellow}⚠️ 限流{end}  {red}💰 额度用完{end}  {red}🔥 服务端错误{end}
+"""
+
+
+def print_banner():
+    if _NO_COLOR:
+        print(f"apicheck v{VERSION} — 快速检测 AI API Key 是否可用")
+        return
+    print(BANNER.format(
+        cyan=C.CYAN, green=C.GREEN, yellow=C.YELLOW, red=C.RED,
+        bold=C.BOLD, dim=C.DIM, end=C.END, version=VERSION,
+    ))
+
+
+def main():
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
+
+    if len(sys.argv) == 1:
+        print_banner()
+        sys.exit(0)
+
+    parser = argparse.ArgumentParser(
+        prog="apicheck",
+        description="快速检测 AI API Key 是否可用",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+支持 16 个服务商:
+  OpenAI, Anthropic, Google Gemini, DeepSeek, Groq,
+  Together AI, Mistral, OpenRouter, Moonshot, Zhipu,
+  Qwen/DashScope, SiliconFlow, Fireworks, Cohere,
+  Mimo Token Plan (tp-), Mimo 订阅计划 (sk-)
+
+示例:
+  apicheck sk-xxxx...
+  apicheck tp-xxxx...
+  apicheck --provider deepseek sk-xxxx...
+  apicheck --batch keys.txt
+  apicheck -q --batch keys.txt
+  echo "sk-xxx" | apicheck -
+        """,
+    )
+    parser.add_argument("keys", nargs="*", help="API Key(s)")
+    parser.add_argument("-p", "--provider", help="指定服务商")
+    parser.add_argument("-b", "--batch", help="从文件读取 Key (每行一个)")
+    parser.add_argument("-j", "--json", action="store_true", help="JSON 输出")
+    parser.add_argument("-q", "--quiet", action="store_true", help="只显示可用的 Key")
+    parser.add_argument("--parallel", type=int, default=4, help="并发数 (默认 4)")
+    parser.add_argument("-v", "--version", action="version", version=f"apicheck {VERSION}")
+
+    args = parser.parse_args()
+    keys = list(args.keys)
+
+    # Stdin
+    if not sys.stdin.isatty() or "-" in keys:
+        stdin_data = sys.stdin.read().strip()
+        if stdin_data:
+            keys.extend(l.strip() for l in stdin_data.splitlines() if l.strip())
+        keys = [k for k in keys if k != "-"]
+
+    # Batch file
+    if args.batch:
+        try:
+            with open(args.batch) as f:
+                keys.extend(l.strip() for l in f if l.strip() and not l.startswith("#"))
+        except FileNotFoundError:
+            print(colorize(f"✗ 文件不存在: {args.batch}", C.RED), file=sys.stderr)
+            sys.exit(1)
+
+    if not keys:
+        parser.print_help()
+        sys.exit(1)
+
+    keys = [k for k in keys if len(k) >= 8]
+    if not keys:
+        print(colorize("✗ 没有有效的 Key (长度至少 8 字符)", C.RED), file=sys.stderr)
+        sys.exit(1)
+
+    # Deduplicate
+    seen = set()
+    keys = [k for k in keys if k not in seen and not seen.add(k)]
+
+    if not args.json:
+        print(colorize(f"\n🔍 apicheck — 检测 {len(keys)} 个 Key\n", C.BOLD))
+
+    def check_one(key):
+        return key, test_key(key, args.provider)
+
+    if len(keys) == 1:
+        all_results = [(keys[0], check_one(keys[0])[1])]
+    else:
+        all_results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as pool:
+            for future in concurrent.futures.as_completed(pool.submit(check_one, k) for k in keys):
+                all_results.append(future.result())
+
+    # Restore order
+    key_order = {k: i for i, k in enumerate(keys)}
+    all_results.sort(key=lambda x: key_order.get(x[0], 999))
+
+    if args.json:
+        output = []
+        for key, results in all_results:
+            output.append({
+                "key": mask_key(key),
+                "results": [
+                    {"provider": r["provider"], "status": r["status"],
+                     "message": r["message"], "elapsed": r["elapsed"]}
+                    for r in results
+                ],
+            })
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+    else:
+        working = 0
+        for key, results in all_results:
+            if args.quiet and not any(r["status"] == "ok" for r in results):
+                continue
+            print_result(mask_key(key), results)
+            if any(r["status"] == "ok" for r in results):
+                working += 1
+
+        if working > 0:
+            print_neon_confirm(working)
+
+        total = len(keys)
+        print(f"{'─' * 60}")
+        print(f"共检测 {total} 个 Key，{colorize(str(working), C.GREEN)} 个可用，"
+              f"{colorize(str(total - working), C.RED)} 个不可用\n")
+
+
+if __name__ == "__main__":
+    main()
